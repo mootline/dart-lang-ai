@@ -167,11 +167,7 @@ void main() {
         await testHarness.connectToDtd();
       });
 
-      // Note: VmService management tests for automatic tracking were removed
-      // when backward compatibility was removed. The new model uses explicit
-      // named connections via connect_dart_tooling_daemon with required name
-      // parameter. VM services are now tracked per-connection in
-      // _namedDtdConnections.
+      // VmService management tests removed - now uses named connections.
 
       test('can take a screenshot', () async {
         await testHarness.startDebugSession(
@@ -213,10 +209,7 @@ void main() {
       });
 
       group('get selected widget', () {
-        // Note: 'when a selected widget exists' test was removed because it
-        // required direct VmService access via activeVmServices, which is no
-        // longer part of the public API. Widget selection is now managed
-        // internally through named DTD connections.
+        // 'when a selected widget exists' test removed - required activeVmServices.
 
         test('when there is no selected widget', () async {
           await testHarness.startDebugSession(

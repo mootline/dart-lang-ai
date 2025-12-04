@@ -82,7 +82,6 @@ base mixin DartToolingDaemonSupport
     _namedDtdConnections.clear();
   }
 
-
   @override
   FutureOr<InitializeResult> initialize(InitializeRequest request) async {
     registerTool(connectTool, _connect);
@@ -293,7 +292,6 @@ base mixin DartToolingDaemonSupport
         case 'activeLocationChanged':
           _activeLocation = e.data;
         default:
-          // Ignore other editor events
       }
     });
     await dtd.streamListen('Editor');
@@ -387,7 +385,6 @@ base mixin DartToolingDaemonSupport
       );
     }
   }
-
 
   /// Takes a screenshot of the currently running app.
   ///
