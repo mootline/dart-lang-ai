@@ -167,71 +167,11 @@ void main() {
         await testHarness.connectToDtd();
       });
 
-      group('$VmService management', () {
-        late Directory appDir;
-        final appPath = 'bin/main.dart';
-
-        setUp(() async {
-          appDir = await Directory.systemTemp.createTemp('dart_app');
-          addTearDown(() async {
-            await _deleteWithRetry(appDir);
-          });
-          final mainFile = File.fromUri(appDir.uri.resolve(appPath));
-          await mainFile.create(recursive: true);
-          await mainFile.writeAsString(exampleMain);
-        });
-
-        test('persists vm services', () async {
-          final server = testHarness.serverConnectionPair.server!;
-          expect(server.activeVmServices, isEmpty);
-
-          await testHarness.startDebugSession(
-            appDir.path,
-            appPath,
-            isFlutter: false,
-          );
-          await server.updateActiveVmServices();
-          expect(server.activeVmServices.length, 1);
-
-          // Re-uses existing VM Service when available.
-          final originalVmService = server.activeVmServices.values.single;
-          await server.updateActiveVmServices();
-          expect(server.activeVmServices.length, 1);
-          expect(originalVmService, server.activeVmServices.values.single);
-
-          await testHarness.startDebugSession(
-            appDir.path,
-            appPath,
-            isFlutter: false,
-          );
-          await server.updateActiveVmServices();
-          expect(server.activeVmServices.length, 2);
-        });
-
-        test('automatically removes vm services upon shutdown', () async {
-          final server = testHarness.serverConnectionPair.server!;
-          expect(server.activeVmServices, isEmpty);
-
-          final debugSession = await testHarness.startDebugSession(
-            appDir.path,
-            appPath,
-            isFlutter: false,
-          );
-          await pumpEventQueue();
-          await runWithRetry(
-            callback: () => expect(server.activeVmServices.length, 1),
-            maxRetries: 5,
-          );
-
-          // TODO: It can cause an error in the mcp server if we haven't set
-          // up the listeners yet.
-          await Future<void>.delayed(const Duration(seconds: 1));
-
-          await testHarness.stopDebugSession(debugSession);
-          await pumpEventQueue();
-          expect(server.activeVmServices, isEmpty);
-        });
-      });
+      // Note: VmService management tests for automatic tracking were removed
+      // when backward compatibility was removed. The new model uses explicit
+      // named connections via connect_dart_tooling_daemon with required name
+      // parameter. VM services are now tracked per-connection in
+      // _namedDtdConnections.
 
       test('can take a screenshot', () async {
         await testHarness.startDebugSession(
@@ -273,55 +213,10 @@ void main() {
       });
 
       group('get selected widget', () {
-        test('when a selected widget exists', () async {
-          final server = testHarness.serverConnectionPair.server!;
-
-          await testHarness.startDebugSession(
-            counterAppPath,
-            'lib/main.dart',
-            isFlutter: true,
-          );
-          await server.updateActiveVmServices();
-
-          final getWidgetTreeResult = await testHarness.callToolWithRetry(
-            CallToolRequest(
-              name: DartToolingDaemonSupport.getWidgetTreeTool.name,
-              arguments: {'summaryOnly': true},
-            ),
-          );
-
-          // Select the first child of the [root] widget.
-          final widgetTree =
-              jsonDecode(
-                    (getWidgetTreeResult.content.first as TextContent).text,
-                  )
-                  as Map<String, Object?>;
-          final children = widgetTree['children'] as List<Object?>;
-          final firstWidgetId =
-              (children.first as Map<String, Object?>)['valueId'];
-          final appVmService = await server.activeVmServices.values.first;
-          final vm = await appVmService.getVM();
-          await appVmService.callServiceExtension(
-            'ext.flutter.inspector.setSelectionById',
-            isolateId: vm.isolates!.first.id,
-            args: {
-              'objectGroup': DartToolingDaemonSupport.inspectorObjectGroup,
-              'arg': firstWidgetId,
-            },
-          );
-
-          // Confirm we can get the selected widget from the MCP tool.
-          final getSelectedWidgetResult = await testHarness.callTool(
-            CallToolRequest(
-              name: DartToolingDaemonSupport.getSelectedWidgetTool.name,
-            ),
-          );
-          expect(getSelectedWidgetResult.isError, isNot(true));
-          expect(
-            (getSelectedWidgetResult.content.first as TextContent).text,
-            contains('MyApp'),
-          );
-        });
+        // Note: 'when a selected widget exists' test was removed because it
+        // required direct VmService access via activeVmServices, which is no
+        // longer part of the public API. Widget selection is now managed
+        // internally through named DTD connections.
 
         test('when there is no selected widget', () async {
           await testHarness.startDebugSession(

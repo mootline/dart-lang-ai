@@ -278,7 +278,25 @@ base mixin DartToolingDaemonSupport
     if (connection.connectedAppServiceIsSupported) {
       await _listenForConnectedAppServiceEventsNamed(connection);
     }
-    // Note: Editor events are global, not per-connection
+
+    // Editor events are global, so only set up once (on first connection)
+    if (_namedDtdConnections.length == 1) {
+      await _listenForEditorEvents(connection.dtd);
+    }
+  }
+
+  /// Listens for editor events like activeLocationChanged.
+  Future<void> _listenForEditorEvents(DartToolingDaemon dtd) async {
+    dtd.onEvent('Editor').listen((e) async {
+      log(LoggingLevel.debug, e.toString());
+      switch (e.kind) {
+        case 'activeLocationChanged':
+          _activeLocation = e.data;
+        default:
+          // Ignore other editor events
+      }
+    });
+    await dtd.streamListen('Editor');
   }
 
   /// Listens for connected app service events on a named connection.
@@ -320,9 +338,50 @@ base mixin DartToolingDaemonSupport
           connection.vmServices[vmServiceUri] = vmServiceConnectUri(vmServiceUri);
       final vmService = await vmServiceFuture;
       // Start listening for and collecting errors immediately.
-      await _AppListener.forVmService(vmService, this);
+      final errorService = await _AppListener.forVmService(vmService, this);
+
+      // Register runtime errors as a resource
+      final resource = Resource(
+        uri: '$runtimeErrorsScheme://${vmService.id}',
+        name: 'Errors for app ${vmServiceInfo.name}',
+        description:
+            'Recent runtime errors seen for app "${vmServiceInfo.name}".',
+      );
+      addResource(resource, (request) async {
+        final watch = Stopwatch()..start();
+        final result = ReadResourceResult(
+          contents: [
+            for (var error in errorService.errorLog.errors)
+              TextResourceContents(uri: resource.uri, text: error),
+          ],
+        );
+        watch.stop();
+        try {
+          analytics?.send(
+            ua.Event.dartMCPEvent(
+              client: clientInfo.name,
+              clientVersion: clientInfo.version,
+              serverVersion: implementation.version,
+              type: AnalyticsEvent.readResource.name,
+              additionalData: ReadResourceMetrics(
+                kind: ResourceKind.runtimeErrors,
+                length: result.contents.length,
+                elapsedMilliseconds: watch.elapsedMilliseconds,
+              ),
+            ),
+          );
+        } catch (e) {
+          log(LoggingLevel.warning, 'Error sending analytics event: $e');
+        }
+        return result;
+      });
+      try {
+        errorService.errorsStream.listen((_) => updateResource(resource));
+      } catch (_) {}
+
       unawaited(
         vmService.onDone.then((_) {
+          removeResource(resource.uri);
           connection.vmServices.remove(vmServiceUri);
         }),
       );

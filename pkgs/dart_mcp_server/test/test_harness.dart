@@ -162,10 +162,12 @@ class TestHarness {
   /// the "connectDartToolingDaemon" tool function.
   ///
   /// By default the DTD Uri will come from the [fakeEditorExtension].
+  /// The [name] parameter identifies this connection for multi-app workflows.
   ///
   /// This mimics a user using the "copy DTD Uri from clipboard" action.
   Future<CallToolResult> connectToDtd({
     String? dtdUri,
+    String name = 'default',
     bool expectError = false,
   }) async {
     final tools = (await mcpServerConnection.listTools()).tools;
@@ -177,7 +179,10 @@ class TestHarness {
     final result = await callToolWithRetry(
       CallToolRequest(
         name: connectTool.name,
-        arguments: {ParameterNames.uri: dtdUri ?? fakeEditorExtension.dtdUri},
+        arguments: {
+          ParameterNames.uri: dtdUri ?? fakeEditorExtension.dtdUri,
+          'name': name,
+        },
       ),
       expectError: expectError,
     );
