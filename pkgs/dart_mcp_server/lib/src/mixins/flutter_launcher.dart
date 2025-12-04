@@ -18,11 +18,12 @@ import '../utils/sdk.dart';
 import '../utils/tools_configuration.dart';
 
 class _RunningApp {
+  final String name;
   final Process process;
   final List<String> logs = [];
   String? dtdUri;
 
-  _RunningApp(this.process);
+  _RunningApp(this.name, this.process);
 }
 
 /// A mixin that provides tools for launching and managing Flutter applications.
@@ -34,7 +35,10 @@ class _RunningApp {
 base mixin FlutterLauncherSupport
     on ToolsSupport, LoggingSupport, RootsTrackingSupport
     implements ProcessManagerSupport, SdkSupport, ToolsConfigurationSupport {
-  final Map<int, _RunningApp> _runningApps = {};
+  // Named process management: name -> app
+  final Map<String, _RunningApp> _runningApps = {};
+  // PID -> name mapping for cleanup and lookup
+  final Map<int, String> _pidToName = {};
 
   @override
   FutureOr<InitializeResult> initialize(InitializeRequest request) {
@@ -48,12 +52,25 @@ base mixin FlutterLauncherSupport
     return super.initialize(request);
   }
 
+  // [ASRT-AGENTS-MCP-MULTI-FRONTEND]: Multiple Flutter instances can run simultaneously
+  // [ASRT-AGENTS-MCP-MULTI-LAUNCH]: Use dartDefines with MOTE_LOGIN for per-instance login
   /// A tool to launch a Flutter application.
   final launchAppTool = Tool(
     name: 'launch_app',
-    description: 'Launches a Flutter application and returns its DTD URI.',
+    description:
+        'Launches a Flutter application and returns its DTD URI. '
+        'For multi-app workflows: provide a unique name for each app, then use '
+        'connect_dart_tooling_daemon with the same name and returned DTD URI. '
+        'Use dartDefines to pass MOTE_LOGIN for per-instance auto-login '
+        '(e.g., MOTE_LOGIN=motename01 logs in as that test account).',
     inputSchema: Schema.object(
       properties: {
+        'name': Schema.string(
+          description:
+              'Unique name for this app instance (e.g., "alice", "bob"). '
+              'Use the same name when calling connect_dart_tooling_daemon. '
+              'If not provided, auto-generates from PID.',
+        ),
         'root': Schema.string(
           description: 'The root directory of the Flutter project.',
         ),
@@ -67,12 +84,23 @@ base mixin FlutterLauncherSupport
               'available devices to present as choices, use the '
               'list_devices tool.',
         ),
+        'dartDefines': Schema.list(
+          description:
+              'Dart define values passed to the app via --dart-define. '
+              'For multi-user testing: ["MOTE_LOGIN=motenameXX"] where XX is '
+              '00-99 (auto-logs in with passwordXX). '
+              'Can also set BACKEND_PORT for custom backend.',
+          items: Schema.string(),
+        ),
       },
       required: ['root', 'device'],
       additionalProperties: false,
     ),
     outputSchema: Schema.object(
       properties: {
+        'name': Schema.string(
+          description: 'The unique name of the launched Flutter application.',
+        ),
         'dtdUri': Schema.string(
           description: 'The DTD URI of the launched Flutter application.',
         ),
@@ -80,7 +108,7 @@ base mixin FlutterLauncherSupport
           description: 'The process ID of the launched Flutter application.',
         ),
       },
-      required: ['dtdUri', 'pid'],
+      required: ['name', 'dtdUri', 'pid'],
     ),
   );
 
@@ -88,12 +116,32 @@ base mixin FlutterLauncherSupport
     final root = request.arguments!['root'] as String;
     final target = request.arguments!['target'] as String?;
     final device = request.arguments!['device'] as String;
-    final completer = Completer<({Uri dtdUri, int pid})>();
+    final dartDefines =
+        (request.arguments!['dartDefines'] as List<dynamic>?)
+            ?.cast<String>() ??
+        [];
+    var name = request.arguments!['name'] as String?;
+    final completer = Completer<({Uri dtdUri, int pid, String name})>();
 
     log(
       LoggingLevel.debug,
-      'Launching app with root: $root, target: $target, device: $device',
+      'Launching app with root: $root, target: $target, device: $device, '
+      'dartDefines: $dartDefines, name: $name',
     );
+
+    // Check for duplicate name
+    if (name != null && _runningApps.containsKey(name)) {
+      return CallToolResult(
+        isError: true,
+        content: [
+          TextContent(
+            text:
+                'An app with name "$name" is already running. '
+                'Use a different name or stop the existing app first.',
+          ),
+        ],
+      );
+    }
 
     Process? process;
     try {
@@ -107,14 +155,18 @@ base mixin FlutterLauncherSupport
           device,
           if (target != null) '--target',
           if (target != null) target,
+          for (final define in dartDefines) '--dart-define=$define',
         ],
         workingDirectory: root,
         mode: ProcessStartMode.normal,
       );
-      _runningApps[process.pid] = _RunningApp(process);
+      // Generate name from PID if not provided
+      name ??= 'app-${process.pid}';
+      _runningApps[name] = _RunningApp(name, process);
+      _pidToName[process.pid] = name;
       log(
         LoggingLevel.info,
-        'Launched Flutter application with PID: ${process.pid}',
+        'Launched Flutter application "$name" with PID: ${process.pid}',
       );
 
       final stdoutDone = Completer<void>();
@@ -122,6 +174,9 @@ base mixin FlutterLauncherSupport
 
       late StreamSubscription stdoutSubscription;
       late StreamSubscription stderrSubscription;
+
+      // Capture the name for use in closures (since name is a local variable)
+      final appName = name!;
 
       void checkForDtdUri(String line) {
         line = line.trim();
@@ -138,7 +193,9 @@ base mixin FlutterLauncherSupport
               if (params['uri'] != null) {
                 final dtdUri = Uri.parse(params['uri'] as String);
                 log(LoggingLevel.debug, 'Found machine DTD URI: $dtdUri');
-                completer.complete((dtdUri: dtdUri, pid: process!.pid));
+                completer.complete(
+                  (dtdUri: dtdUri, pid: process!.pid, name: appName),
+                );
               }
             }
           } on FormatException {
@@ -157,7 +214,7 @@ base mixin FlutterLauncherSupport
                 LoggingLevel.debug,
                 '[flutter stdout ${process!.pid}]: $line',
               );
-              _runningApps[process.pid]?.logs.add('[stdout] $line');
+              _runningApps[appName]?.logs.add('[stdout] $line');
               checkForDtdUri(line);
             },
             onDone: stdoutDone.complete,
@@ -173,7 +230,7 @@ base mixin FlutterLauncherSupport
                 LoggingLevel.warning,
                 '[flutter stderr ${process!.pid}]: $line',
               );
-              _runningApps[process.pid]?.logs.add('[stderr] $line');
+              _runningApps[appName]?.logs.add('[stderr] $line');
               checkForDtdUri(line);
             },
             onDone: stderrDone.complete,
@@ -188,10 +245,10 @@ base mixin FlutterLauncherSupport
 
           log(
             LoggingLevel.info,
-            'Flutter application ${process!.pid} exited with code $exitCode.',
+            'Flutter application "$appName" (PID ${process!.pid}) exited with code $exitCode.',
           );
           if (!completer.isCompleted) {
-            final logs = _runningApps[process.pid]?.logs ?? [];
+            final logs = _runningApps[appName]?.logs ?? [];
             // Only output the last 500 lines of logs.
             final startLine = math.max(0, logs.length - 500);
             final logOutput = [
@@ -199,11 +256,12 @@ base mixin FlutterLauncherSupport
               ...logs.sublist(startLine),
             ];
             completer.completeError(
-              'Flutter application exited with code $exitCode before the DTD '
+              'Flutter application "$appName" exited with code $exitCode before the DTD '
               'URI was found, with log output:\n${logOutput.join('\n')}',
             );
           }
-          _runningApps.remove(process.pid);
+          _runningApps.remove(appName);
+          _pidToName.remove(process.pid);
 
           // Cancel subscriptions after all processing is done.
           await stdoutSubscription.cancel();
@@ -214,17 +272,18 @@ base mixin FlutterLauncherSupport
       final result = await completer.future.timeout(
         const Duration(seconds: 90),
       );
-      _runningApps[result.pid]?.dtdUri = result.dtdUri.toString();
+      _runningApps[result.name]?.dtdUri = result.dtdUri.toString();
 
       return CallToolResult(
         content: [
           TextContent(
             text:
-                'Flutter application launched successfully with PID '
+                'Flutter application "${result.name}" launched successfully with PID '
                 '${result.pid} with the DTD URI ${result.dtdUri}',
           ),
         ],
         structuredContent: {
+          'name': result.name,
           'dtdUri': result.dtdUri.toString(),
           'pid': result.pid,
         },
@@ -232,6 +291,12 @@ base mixin FlutterLauncherSupport
     } catch (e, s) {
       log(LoggingLevel.error, 'Error launching Flutter application: $e\n$s');
       if (process != null) {
+        // Clean up both mappings on error
+        final appName = _pidToName[process.pid];
+        if (appName != null) {
+          _runningApps.remove(appName);
+        }
+        _pidToName.remove(process.pid);
         processManager.killPid(process.pid);
         // The exitCode handler will perform the rest of the cleanup.
       }
@@ -251,11 +316,17 @@ base mixin FlutterLauncherSupport
         'Kills a running Flutter process started by the launch_app tool.',
     inputSchema: Schema.object(
       properties: {
+        'name': Schema.string(
+          description:
+              'The name of the app to stop (as provided to launch_app). '
+              'Either name or pid must be provided.',
+        ),
         'pid': Schema.int(
-          description: 'The process ID of the process to kill.',
+          description:
+              'The process ID of the process to kill. '
+              'Either name or pid must be provided.',
         ),
       },
-      required: ['pid'],
       additionalProperties: false,
     ),
     outputSchema: Schema.object(
@@ -269,15 +340,46 @@ base mixin FlutterLauncherSupport
   );
 
   Future<CallToolResult> _stopApp(CallToolRequest request) async {
-    final pid = request.arguments!['pid'] as int;
-    log(LoggingLevel.info, 'Attempting to stop application with PID: $pid');
-    final app = _runningApps[pid];
+    final nameArg = request.arguments!['name'] as String?;
+    final pidArg = request.arguments!['pid'] as int?;
 
-    if (app == null) {
-      log(LoggingLevel.error, 'Application with PID $pid not found.');
+    // Find the app by name or PID
+    _RunningApp? app;
+    String? appName;
+    int? pid;
+
+    if (nameArg != null) {
+      app = _runningApps[nameArg];
+      appName = nameArg;
+      pid = app?.process.pid;
+    } else if (pidArg != null) {
+      appName = _pidToName[pidArg];
+      if (appName != null) {
+        app = _runningApps[appName];
+      }
+      pid = pidArg;
+    } else {
       return CallToolResult(
         isError: true,
-        content: [TextContent(text: 'Application with PID $pid not found.')],
+        content: [
+          TextContent(
+            text: 'Either "name" or "pid" must be provided to stop an app.',
+          ),
+        ],
+      );
+    }
+
+    log(
+      LoggingLevel.info,
+      'Attempting to stop application: name="$appName", pid=$pid',
+    );
+
+    if (app == null || pid == null) {
+      final identifier = nameArg != null ? 'name "$nameArg"' : 'PID $pidArg';
+      log(LoggingLevel.error, 'Application with $identifier not found.');
+      return CallToolResult(
+        isError: true,
+        content: [TextContent(text: 'Application with $identifier not found.')],
       );
     }
 
@@ -285,12 +387,12 @@ base mixin FlutterLauncherSupport
     if (success) {
       log(
         LoggingLevel.info,
-        'Successfully sent kill signal to application $pid.',
+        'Successfully sent kill signal to application "$appName" (PID $pid).',
       );
     } else {
       log(
         LoggingLevel.warning,
-        'Failed to send kill signal to application $pid.',
+        'Failed to send kill signal to application "$appName" (PID $pid).',
       );
     }
 
@@ -298,7 +400,7 @@ base mixin FlutterLauncherSupport
       content: [
         TextContent(
           text:
-              'Application with PID $pid '
+              'Application "$appName" (PID $pid) '
               '${success ? 'was stopped' : 'was unable to be stopped'}.',
         ),
       ],
@@ -397,14 +499,19 @@ base mixin FlutterLauncherSupport
   final getAppLogsTool = Tool(
     name: 'get_app_logs',
     description:
-        'Returns the collected logs for a given flutter run process '
-        'id. Can only retrieve logs started by the launch_app tool.',
+        'Returns the collected logs for a given flutter run process. '
+        'Can only retrieve logs started by the launch_app tool.',
     inputSchema: Schema.object(
       properties: {
+        'name': Schema.string(
+          description:
+              'The name of the app (as provided to launch_app). '
+              'Either name or pid must be provided.',
+        ),
         'pid': Schema.int(
           description:
               'The process ID of the flutter run process running the '
-              'application.',
+              'application. Either name or pid must be provided.',
         ),
         'maxLines': Schema.int(
           description:
@@ -412,7 +519,6 @@ base mixin FlutterLauncherSupport
               'logs. Defaults to 500. If set to -1, all logs will be returned.',
         ),
       },
-      required: ['pid'],
       additionalProperties: false,
     ),
     outputSchema: Schema.object(
@@ -427,21 +533,47 @@ base mixin FlutterLauncherSupport
   );
 
   Future<CallToolResult> _getAppLogs(CallToolRequest request) async {
-    final pid = request.arguments!['pid'] as int;
+    final nameArg = request.arguments!['name'] as String?;
+    final pidArg = request.arguments!['pid'] as int?;
     var maxLines = request.arguments!['maxLines'] as int? ?? 500;
-    log(LoggingLevel.info, 'Getting logs for application with PID: $pid');
-    var logs = _runningApps[pid]?.logs;
+
+    // Find the app by name or PID
+    _RunningApp? app;
+    String? appName;
+
+    if (nameArg != null) {
+      app = _runningApps[nameArg];
+      appName = nameArg;
+    } else if (pidArg != null) {
+      appName = _pidToName[pidArg];
+      if (appName != null) {
+        app = _runningApps[appName];
+      }
+    } else {
+      return CallToolResult(
+        isError: true,
+        content: [
+          TextContent(
+            text: 'Either "name" or "pid" must be provided to get logs.',
+          ),
+        ],
+      );
+    }
+
+    log(LoggingLevel.info, 'Getting logs for application: name="$appName"');
+    var logs = app?.logs;
 
     if (logs == null) {
+      final identifier = nameArg != null ? 'name "$nameArg"' : 'PID $pidArg';
       log(
         LoggingLevel.error,
-        'Application with PID $pid not found or has no logs.',
+        'Application with $identifier not found or has no logs.',
       );
       return CallToolResult(
         isError: true,
         content: [
           TextContent(
-            text: 'Application with PID $pid not found or has no logs.',
+            text: 'Application with $identifier not found or has no logs.',
           ),
         ],
       );
@@ -468,7 +600,7 @@ base mixin FlutterLauncherSupport
   final listRunningAppsTool = Tool(
     name: 'list_running_apps',
     description:
-        'Returns the list of running app process IDs and associated '
+        'Returns the list of running app names, process IDs and associated '
         'DTD URIs for apps started by the launch_app tool.',
     inputSchema: Schema.object(),
     outputSchema: Schema.object(
@@ -479,6 +611,9 @@ base mixin FlutterLauncherSupport
               'launch_app tool.',
           items: Schema.object(
             properties: {
+              'name': Schema.string(
+                description: 'The unique name of the application.',
+              ),
               'pid': Schema.int(
                 description: 'The process ID of the application.',
               ),
@@ -486,7 +621,7 @@ base mixin FlutterLauncherSupport
                 description: 'The DTD URI of the application.',
               ),
             },
-            required: ['pid', 'dtdUri'],
+            required: ['name', 'pid', 'dtdUri'],
           ),
         ),
       },
@@ -499,7 +634,11 @@ base mixin FlutterLauncherSupport
     final apps = _runningApps.entries
         .where((entry) => entry.value.dtdUri != null)
         .map((entry) {
-          return {'pid': entry.key, 'dtdUri': entry.value.dtdUri!};
+          return {
+            'name': entry.key,
+            'pid': entry.value.process.pid,
+            'dtdUri': entry.value.dtdUri!,
+          };
         })
         .toList();
 
@@ -510,7 +649,7 @@ base mixin FlutterLauncherSupport
               'Found ${apps.length} running application'
               '${apps.length == 1 ? '' : 's'}.\n'
               '${apps.map<String>((e) {
-                return 'PID: ${e['pid']}, DTD URI: ${e['dtdUri']}';
+                return 'Name: ${e['name']}, PID: ${e['pid']}, DTD URI: ${e['dtdUri']}';
               }).toList().join('\n')}',
         ),
       ],
@@ -521,11 +660,15 @@ base mixin FlutterLauncherSupport
   @override
   Future<void> shutdown() {
     log(LoggingLevel.info, 'Shutting down server, killing all processes.');
-    for (final pid in _runningApps.keys) {
-      log(LoggingLevel.debug, 'Killing process $pid.');
-      processManager.killPid(pid);
+    for (final entry in _runningApps.entries) {
+      log(
+        LoggingLevel.debug,
+        'Killing process "${entry.key}" (PID ${entry.value.process.pid}).',
+      );
+      processManager.killPid(entry.value.process.pid);
     }
     _runningApps.clear();
+    _pidToName.clear();
     return super.shutdown();
   }
 }

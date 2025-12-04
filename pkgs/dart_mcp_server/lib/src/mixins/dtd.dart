@@ -25,28 +25,24 @@ import '../utils/tools_configuration.dart';
 /// https://pub.dev/packages/dtd).
 ///
 /// The MCPServer must already have the [ToolsSupport] mixin applied.
+///
+/// [ASRT-AGENTS-MCP-MULTI-FRONTEND]: Supports multiple simultaneous connections
+/// for multi-app workflows where different test accounts run in parallel.
 base mixin DartToolingDaemonSupport
     on ToolsSupport, LoggingSupport, ResourcesSupport
     implements AnalyticsSupport, ToolsConfigurationSupport {
-  DartToolingDaemon? _dtd;
+  /// Named DTD connections for multi-app support.
+  /// Maps app name -> DTD connection and associated state.
+  final Map<String, _NamedDtdConnection> _namedDtdConnections = {};
+
+  /// The currently active app name for commands.
+  String? _activeAppName;
 
   /// The last reported active location from the editor.
   Map<String, Object?>? _activeLocation;
 
-  /// A Map of [VmService] object [Future]s by their VM Service URI.
-  ///
-  /// [VmService] objects are automatically removed from the Map when they
-  /// are unregistered via DTD or when the VM service shuts down.
-  @visibleForTesting
-  final activeVmServices = <String, Future<VmService>>{};
-
-  /// Whether or not the connected app service is supported.
-  ///
-  /// Once we connect to dtd, this may be toggled to `true`.
-  bool _connectedAppServiceIsSupported = false;
-
   /// Whether to await the disposal of all [VmService] objects in
-  /// [activeVmServices] upon server shutdown or loss of DTD connection.
+  /// named connections upon server shutdown or loss of DTD connection.
   ///
   /// Defaults to false but can be flipped to true for testing purposes.
   @visibleForTesting
@@ -68,91 +64,29 @@ base mixin DartToolingDaemonSupport
 
   /// Called when the DTD connection is lost, resets all associated state.
   Future<void> _resetDtd() async {
-    _dtd = null;
     _activeLocation = null;
-    _connectedAppServiceIsSupported = false;
+    _activeAppName = null;
 
     // TODO: determine whether we need to dispose the [inspectorObjectGroup] on
     // the Flutter Widget Inspector for each VM service instance.
 
-    final future = Future.wait(
-      activeVmServices.values.map(
-        (vmService) => vmService.then((service) => service.dispose()),
-      ),
-    );
-    debugAwaitVmServiceDisposal ? await future : unawaited(future);
-
-    activeVmServices.clear();
-  }
-
-  @visibleForTesting
-  Future<void> updateActiveVmServices() async {
-    final dtd = _dtd;
-    if (dtd == null) return;
-    if (!_connectedAppServiceIsSupported) return;
-
-    final vmServiceInfos = (await dtd.getVmServices()).vmServicesInfos;
-    if (vmServiceInfos.isEmpty) return;
-
-    for (final vmServiceInfo in vmServiceInfos) {
-      final vmServiceUri = vmServiceInfo.uri;
-      if (activeVmServices.containsKey(vmServiceUri)) {
-        continue;
-      }
-      final vmServiceFuture = activeVmServices[vmServiceUri] =
-          vmServiceConnectUri(vmServiceUri);
-      final vmService = await vmServiceFuture;
-      // Start listening for and collecting errors immediately.
-      final errorService = await _AppListener.forVmService(vmService, this);
-      final resource = Resource(
-        uri: '$runtimeErrorsScheme://${vmService.id}',
-        name: 'Errors for app ${vmServiceInfo.name}',
-        description:
-            'Recent runtime errors seen for app "${vmServiceInfo.name}".',
+    // Clean up all named connections
+    for (final connection in _namedDtdConnections.values) {
+      final future = Future.wait(
+        connection.vmServices.values.map(
+          (vmService) => vmService.then((service) => service.dispose()),
+        ),
       );
-      addResource(resource, (request) async {
-        final watch = Stopwatch()..start();
-        final result = ReadResourceResult(
-          contents: [
-            for (var error in errorService.errorLog.errors)
-              TextResourceContents(uri: resource.uri, text: error),
-          ],
-        );
-        watch.stop();
-        try {
-          analytics?.send(
-            ua.Event.dartMCPEvent(
-              client: clientInfo.name,
-              clientVersion: clientInfo.version,
-              serverVersion: implementation.version,
-              type: AnalyticsEvent.readResource.name,
-              additionalData: ReadResourceMetrics(
-                kind: ResourceKind.runtimeErrors,
-                length: result.contents.length,
-                elapsedMilliseconds: watch.elapsedMilliseconds,
-              ),
-            ),
-          );
-        } catch (e) {
-          log(LoggingLevel.warning, 'Error sending analytics event: $e');
-        }
-        return result;
-      });
-      try {
-        errorService.errorsStream.listen((_) => updateResource(resource));
-      } catch (_) {}
-      unawaited(
-        vmService.onDone.then((_) {
-          removeResource(resource.uri);
-          activeVmServices.remove(vmServiceUri);
-        }),
-      );
+      debugAwaitVmServiceDisposal ? await future : unawaited(future);
     }
+    _namedDtdConnections.clear();
   }
+
 
   @override
   FutureOr<InitializeResult> initialize(InitializeRequest request) async {
     registerTool(connectTool, _connect);
+    registerTool(selectAppTool, _selectApp);
     registerTool(getRuntimeErrorsTool, runtimeErrors);
     registerTool(getActiveLocationTool, _getActiveLocation);
     registerTool(hotRestartTool, hotRestart);
@@ -225,35 +159,63 @@ base mixin DartToolingDaemonSupport
     );
   }
 
-  /// Connects to the Dart Tooling Daemon.
+  /// Connects to the Dart Tooling Daemon with a unique name.
+  ///
+  /// [ASRT-AGENTS-MCP-MULTI-FRONTEND]: Each connection must have a unique name
+  /// for multi-app management.
   FutureOr<CallToolResult> _connect(CallToolRequest request) async {
-    if (_dtd != null) {
-      return _dtdAlreadyConnected;
+    final name = request.arguments!['name'] as String;
+
+    if (_namedDtdConnections.containsKey(name)) {
+      return CallToolResult(
+        isError: true,
+        content: [
+          TextContent(
+            text:
+                'A connection named "$name" already exists. '
+                'Use a different name or disconnect the existing one first.',
+          ),
+        ],
+      );
     }
 
     try {
-      final dtd = _dtd = await DartToolingDaemon.connect(
+      final dtd = await DartToolingDaemon.connect(
         Uri.parse(request.arguments![ParameterNames.uri] as String),
       );
       try {
         await dtd.call(null, 'getVM');
-        // If the call above succeeds, we were connected to the vm service, and
-        // should error.
-        await _resetDtd();
         return _gotVmServiceUri;
       } on RpcException catch (e) {
-        // Double check the failure was a method not found failure, if not
-        // rethrow it.
         if (e.code != RpcErrorCodes.kMethodNotFound) {
-          await _resetDtd();
           rethrow;
         }
       }
-      unawaited(_dtd!.done.then((_) async => await _resetDtd()));
 
-      await _listenForServices();
+      final namedConnection = _NamedDtdConnection(name, dtd);
+      _namedDtdConnections[name] = namedConnection;
+
+      // Auto-select if this is the first connection
+      _activeAppName ??= name;
+
+      unawaited(dtd.done.then((_) async {
+        _namedDtdConnections.remove(name);
+        if (_activeAppName == name) {
+          _activeAppName = _namedDtdConnections.keys.firstOrNull;
+        }
+      }));
+
+      // Set up services for this named connection
+      await _listenForServicesNamed(namedConnection);
+
       return CallToolResult(
-        content: [TextContent(text: 'Connection succeeded')],
+        content: [
+          TextContent(
+            text:
+                'Connection "$name" succeeded. '
+                '${_activeAppName == name ? "(now active)" : ""}',
+          ),
+        ],
       );
     } on WebSocketException catch (_) {
       return CallToolResult(
@@ -272,39 +234,65 @@ base mixin DartToolingDaemonSupport
     }
   }
 
-  /// Listens to the `ConnectedApp` and `Editor` streams to get app and IDE
-  /// state information.
-  ///
-  /// The dart tooling daemon must be connected prior to calling this function.
-  Future<void> _listenForServices() async {
-    final dtd = _dtd!;
+  /// Selects the active app for subsequent commands.
+  FutureOr<CallToolResult> _selectApp(CallToolRequest request) async {
+    final name = request.arguments!['name'] as String;
 
-    _connectedAppServiceIsSupported = false;
+    if (!_namedDtdConnections.containsKey(name)) {
+      final available = _namedDtdConnections.keys.toList();
+      return CallToolResult(
+        isError: true,
+        content: [
+          TextContent(
+            text:
+                'No connection named "$name" exists. '
+                'Available connections: ${available.isEmpty ? "(none)" : available.join(", ")}',
+          ),
+        ],
+      );
+    }
+
+    _activeAppName = name;
+    return CallToolResult(
+      content: [
+        TextContent(text: 'App "$name" is now active for subsequent commands.'),
+      ],
+    );
+  }
+
+  /// Sets up service listeners for a named connection (multi-app support).
+  Future<void> _listenForServicesNamed(_NamedDtdConnection connection) async {
+    final dtd = connection.dtd;
+
+    connection.connectedAppServiceIsSupported = false;
     try {
       final registeredServices = await dtd.getRegisteredServices();
       if (registeredServices.dtdServices.contains(
         '${ConnectedAppServiceConstants.serviceName}.'
         '${ConnectedAppServiceConstants.getVmServices}',
       )) {
-        _connectedAppServiceIsSupported = true;
+        connection.connectedAppServiceIsSupported = true;
       }
     } catch (_) {}
 
-    if (_connectedAppServiceIsSupported) {
-      await _listenForConnectedAppServiceEvents();
+    if (connection.connectedAppServiceIsSupported) {
+      await _listenForConnectedAppServiceEventsNamed(connection);
     }
-    await _listenForEditorEvents();
+    // Note: Editor events are global, not per-connection
   }
 
-  Future<void> _listenForConnectedAppServiceEvents() async {
-    final dtd = _dtd!;
+  /// Listens for connected app service events on a named connection.
+  Future<void> _listenForConnectedAppServiceEventsNamed(
+    _NamedDtdConnection connection,
+  ) async {
+    final dtd = connection.dtd;
     dtd.onVmServiceUpdate().listen((e) async {
-      log(LoggingLevel.debug, e.toString());
+      log(LoggingLevel.debug, '[${connection.name}] ${e.toString()}');
       switch (e.kind) {
         case ConnectedAppServiceConstants.vmServiceRegistered:
-          await updateActiveVmServices();
+          await _updateActiveVmServicesNamed(connection);
         case ConnectedAppServiceConstants.vmServiceUnregistered:
-          await activeVmServices
+          await connection.vmServices
               .remove(e.data['uri'] as String)
               ?.then((service) => service.dispose());
         default:
@@ -313,19 +301,34 @@ base mixin DartToolingDaemonSupport
     await dtd.streamListen(ConnectedAppServiceConstants.serviceName);
   }
 
-  /// Listens for editor specific events.
-  Future<void> _listenForEditorEvents() async {
-    final dtd = _dtd!;
-    dtd.onEvent('Editor').listen((e) async {
-      log(LoggingLevel.debug, e.toString());
-      switch (e.kind) {
-        case 'activeLocationChanged':
-          _activeLocation = e.data;
-        default:
+  /// Updates VM services for a named connection.
+  Future<void> _updateActiveVmServicesNamed(
+    _NamedDtdConnection connection,
+  ) async {
+    if (!connection.connectedAppServiceIsSupported) return;
+
+    final vmServiceInfos =
+        (await connection.dtd.getVmServices()).vmServicesInfos;
+    if (vmServiceInfos.isEmpty) return;
+
+    for (final vmServiceInfo in vmServiceInfos) {
+      final vmServiceUri = vmServiceInfo.uri;
+      if (connection.vmServices.containsKey(vmServiceUri)) {
+        continue;
       }
-    });
-    await dtd.streamListen('Editor');
+      final vmServiceFuture =
+          connection.vmServices[vmServiceUri] = vmServiceConnectUri(vmServiceUri);
+      final vmService = await vmServiceFuture;
+      // Start listening for and collecting errors immediately.
+      await _AppListener.forVmService(vmService, this);
+      unawaited(
+        vmService.onDone.then((_) {
+          connection.vmServices.remove(vmServiceUri);
+        }),
+      );
+    }
   }
+
 
   /// Takes a screenshot of the currently running app.
   ///
@@ -666,25 +669,58 @@ base mixin DartToolingDaemonSupport
     );
   }
 
-  /// Calls [callback] on the first active debug session, if available.
+  /// Calls [callback] on the active debug session, if available.
+  ///
+  /// Uses the active app's VM service from named connections.
   Future<CallToolResult> _callOnVmService({
     required Future<CallToolResult> Function(VmService) callback,
   }) async {
-    final dtd = _dtd;
-    if (dtd == null) return _dtdNotConnected;
-    if (!_connectedAppServiceIsSupported) return _connectedAppsNotSupported;
+    if (_namedDtdConnections.isEmpty) {
+      return _dtdNotConnected;
+    }
 
-    await updateActiveVmServices();
-    if (activeVmServices.isEmpty) return _noActiveDebugSession;
+    final activeName = _activeAppName;
+    if (activeName == null) {
+      return CallToolResult(
+        isError: true,
+        content: [
+          TextContent(
+            text: 'No active app selected. Use select_app to choose an app.',
+          ),
+        ],
+      );
+    }
 
-    // TODO: support selecting a VM Service if more than one are available.
-    final vmService = activeVmServices.values.first;
+    final connection = _namedDtdConnections[activeName];
+    if (connection == null) {
+      return CallToolResult(
+        isError: true,
+        content: [
+          TextContent(
+            text:
+                'Active app "$activeName" no longer exists. '
+                'Use select_app to choose a different app.',
+          ),
+        ],
+      );
+    }
+
+    if (!connection.connectedAppServiceIsSupported) {
+      return _connectedAppsNotSupported;
+    }
+
+    await _updateActiveVmServicesNamed(connection);
+    if (connection.vmServices.isEmpty) {
+      return _noActiveDebugSession;
+    }
+
+    final vmService = connection.vmServices.values.first;
     return await callback(await vmService);
   }
 
   /// Retrieves the active location from the editor.
   Future<CallToolResult> _getActiveLocation(CallToolRequest request) async {
-    if (_dtd == null) return _dtdNotConnected;
+    if (_namedDtdConnections.isEmpty) return _dtdNotConnected;
 
     final activeLocation = _activeLocation;
     if (activeLocation == null) {
@@ -908,19 +944,54 @@ base mixin DartToolingDaemonSupport
     ),
   );
 
+  // [ASRT-AGENTS-MCP-MULTI-FRONTEND]: Connect to DTD with required name
   @visibleForTesting
   static final connectTool = Tool(
     name: 'connect_dart_tooling_daemon',
     description:
-        'Connects to the Dart Tooling Daemon. You should get the uri either '
-        'from available tools or the user, do not just make up a random URI to '
-        'pass. When asking the user for the uri, you should suggest the "Copy '
-        'DTD Uri to clipboard" action. When reconnecting after losing a '
-        'connection, always request a new uri first.',
+        'Connects to the Dart Tooling Daemon with a unique name. '
+        'Each connection must have a name (e.g., "alice", "bob") to identify it. '
+        'Get the DTD URI from launch_app output or the user. '
+        'When reconnecting after losing a connection, request a new URI first. '
+        'The first connection becomes automatically active. Use select_app to '
+        'switch between multiple connected apps.',
     annotations: ToolAnnotations(title: 'Connect to DTD', readOnlyHint: true),
     inputSchema: Schema.object(
-      properties: {ParameterNames.uri: Schema.string()},
-      required: const [ParameterNames.uri],
+      properties: {
+        ParameterNames.uri: Schema.string(
+          description: 'The DTD URI from launch_app output or user.',
+        ),
+        'name': Schema.string(
+          description:
+              'Unique name for this connection (e.g., "alice", "bob"). '
+              'Use the same name given to launch_app for consistency.',
+        ),
+      },
+      required: const [ParameterNames.uri, 'name'],
+      additionalProperties: false,
+    ),
+  );
+
+  // [ASRT-AGENTS-MCP-MULTI-SWITCH]: Switch between frontends via select_app
+  /// A tool to switch the active app for subsequent commands.
+  @visibleForTesting
+  static final selectAppTool = Tool(
+    name: 'select_app',
+    description:
+        'Switch which app is active for subsequent DTD commands like '
+        'flutter_driver, hot_reload, get_widget_tree, take_screenshot, etc. '
+        'When multiple apps are connected, use this to switch between them '
+        'before taking actions. Use list_running_apps to see available names.',
+    annotations: ToolAnnotations(title: 'Select App', readOnlyHint: true),
+    inputSchema: Schema.object(
+      properties: {
+        'name': Schema.string(
+          description:
+              'The name of the app to make active (as provided to '
+              'launch_app and connect_dart_tooling_daemon).',
+        ),
+      },
+      required: const ['name'],
       additionalProperties: false,
     ),
   );
@@ -1080,22 +1151,11 @@ base mixin DartToolingDaemonSupport
     content: [
       TextContent(
         text:
-            'The dart tooling daemon is not connected, you need to call '
-            '"${connectTool.name}" first.',
+            'No DTD connections exist. Use "${connectTool.name}" with a name '
+            'and DTD URI to connect to a Flutter app first.',
       ),
     ],
   )..failureReason = CallToolFailureReason.dtdNotConnected;
-
-  static final _dtdAlreadyConnected = CallToolResult(
-    isError: true,
-    content: [
-      TextContent(
-        text:
-            'The dart tooling daemon is already connected, you cannot call '
-            '"${connectTool.name}" again.',
-      ),
-    ],
-  )..failureReason = CallToolFailureReason.dtdAlreadyConnected;
 
   static final _noActiveDebugSession = CallToolResult(
     content: [TextContent(text: 'No active debug session.')],
@@ -1370,4 +1430,14 @@ extension on VmService {
   static final _ids = Expando<String>();
   static int _nextId = 0;
   String get id => _ids[this] ??= '${_nextId++}';
+}
+
+/// Holds state for a named DTD connection (for multi-app support).
+class _NamedDtdConnection {
+  final String name;
+  final DartToolingDaemon dtd;
+  final Map<String, Future<VmService>> vmServices = {};
+  bool connectedAppServiceIsSupported = false;
+
+  _NamedDtdConnection(this.name, this.dtd);
 }
